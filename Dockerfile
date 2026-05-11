@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bullseye
 
 RUN apt-get update && apt-get install -y \
     wget \
@@ -16,7 +16,6 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install-deps
 
 COPY robux_tracker.py .
 
