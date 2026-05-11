@@ -4,6 +4,8 @@ import re
 from datetime import datetime, timezone, timedelta
 import requests
 import threading
+import os
+import sys
 
 # ========== CONFIGURATION ==========
 TARGET_PRICE = 0.004
@@ -23,12 +25,10 @@ last_alerted_offers = set()
 last_update_id = 0
 running = True
 processing_commands = False
-bot_message_ids = []  # Track bot message IDs
+startup_sent = False
 
 def send_telegram(message, parse_mode="HTML"):
-    """Send message and track its ID for potential deletion"""
-    global bot_message_ids
-    
+    """Send message via Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         response = requests.post(url, json={
@@ -37,51 +37,15 @@ def send_telegram(message, parse_mode="HTML"):
             "parse_mode": parse_mode,
             "disable_web_page_preview": True
         }, timeout=10)
-        
         if response.status_code == 200:
-            result = response.json()
-            message_id = result['result']['message_id']
-            bot_message_ids.append(message_id)
-            # Keep only last 200 IDs
-            if len(bot_message_ids) > 200:
-                bot_message_ids = bot_message_ids[-100:]
             print("  [Telegram OK]")
+            return True
         else:
             print(f"  [Telegram Error: {response.status_code}]")
+            return False
     except Exception as e:
         print(f"  [Telegram Error: {e}]")
-
-def delete_bot_message(message_id):
-    """Delete a specific bot message"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
-    try:
-        response = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "message_id": message_id
-        }, timeout=10)
-        return response.status_code == 200
-    except:
         return False
-
-def clear_bot_messages():
-    """Delete ALL messages ever sent by the bot"""
-    global bot_message_ids
-    
-    if not bot_message_ids:
-        send_telegram("No bot messages to delete")
-        return
-    
-    send_telegram(f"Cleaning {len(bot_message_ids)} bot messages...")
-    
-    deleted = 0
-    for msg_id in bot_message_ids:
-        if delete_bot_message(msg_id):
-            deleted += 1
-        time.sleep(0.1)  # Rate limit to avoid hitting Telegram limits
-    
-    bot_message_ids = []
-    # Send confirmation that will also be tracked (but user will see it briefly)
-    send_telegram(f"Cleaned {deleted} messages", delete_after=3)
 
 def check_for_commands():
     """Check for Telegram commands"""
@@ -119,10 +83,6 @@ def check_for_commands():
                     low = int(MIN_QUANTITY * 0.25)
                     high = int(MIN_QUANTITY * 1.75)
                     send_telegram(f"Minimum quantity: {MIN_QUANTITY} Robux\nMatches: {low} - {high} Robux (75% tolerance)")
-                
-                elif text == '/clean' or text == '/cls':
-                    # This will delete all bot messages (not user messages)
-                    clear_bot_messages()
                 
                 elif text.startswith('/setprice'):
                     parts = text.split()
@@ -163,20 +123,25 @@ def check_for_commands():
                             except:
                                 send_telegram("Invalid number. Example: /setmin 2000")
                 
+                elif text == '/check':
+                    # Force a manual check
+                    send_telegram("Checking prices now...")
+                    offers = get_offers()
+                    if offers and len(offers) > 0:
+                        best = offers[0]
+                        send_telegram(f"Best offer: €{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)")
+                    else:
+                        send_telegram("No offers found in range")
+                
                 elif text == '/help':
                     help_msg = """<b>Commands:</b>
-
 /price - Show target price
-/setprice X - Set new target (eg: /setprice 0.0035)
-
+/setprice X - Set new target
 /min - Show min quantity setting
 /setmin X - Set min quantity (75% tolerance)
 /setmin off - Disable min quantity
-
-/clean or /cls - Delete all bot messages
-
+/check - Force price check
 /help - This message"""
-
                     send_telegram(help_msg)
                 
     except Exception as e:
@@ -195,32 +160,37 @@ def is_quantity_match(offer_qty):
     return lower <= offer_qty <= upper
 
 def get_offers():
-    """Get offers - filter by quantity"""
+    """Get offers using direct HTTP request (faster, more reliable on Railway)"""
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            )
-            page = context.new_page()
-            page.goto(URL, timeout=30000)
-            page.wait_for_selector('.buy-unit-price', timeout=15000)
-            page.wait_for_timeout(2000)
-            
-            html = page.content()
-            browser.close()
+        # Try simple requests first (some data might be server-side rendered)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'de,en-US;q=0.7,en;q=0.3',
+        }
+        
+        response = requests.get(URL, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            html = response.text
             
             all_offers = []
-            offer_blocks = re.split(r'<div[^>]*class="[^"]*offer[^"]*"[^>]*>', html, re.IGNORECASE)
             
-            for block in offer_blocks:
-                price_match = re.search(r'([\d.,]+)\s*&nbsp;€', block)
-                if price_match:
-                    price = float(price_match.group(1).replace(',', '.'))
-                    if 0.0001 < price < 0.05:  # Made more flexible - any price okay
-                        qty_match = re.search(r'Min\.\s*menge:</span>\s*(\d+)', block, re.IGNORECASE)
-                        quantity = int(qty_match.group(1)) if qty_match else None
+            # Look for price patterns in the HTML
+            price_pattern = r'([\d.,]+)\s*&nbsp;€'
+            prices = re.findall(price_pattern, html)
+            
+            quantity_pattern = r'Min\.\s*menge:</span>\s*(\d+)'
+            quantities = re.findall(quantity_pattern, html, re.IGNORECASE)
+            
+            for i, price_str in enumerate(prices):
+                try:
+                    price = float(price_str.replace(',', '.'))
+                    if 0.0001 < price < 0.05:
+                        quantity = int(quantities[i]) if i < len(quantities) else None
                         all_offers.append({'price': price, 'quantity': quantity})
+                except:
+                    continue
             
             # Remove duplicates
             unique = []
@@ -237,10 +207,55 @@ def get_offers():
                 filtered = [o for o in unique if is_quantity_match(o['quantity'])]
                 return filtered
             return unique
+        
+        return None
             
     except Exception as e:
-        print(f"  [Error: {e}]")
-        return None
+        print(f"  [Requests error: {e}]")
+        
+        # Fallback to Playwright if requests fails
+        try:
+            print("  Trying Playwright fallback...")
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+                page = browser.new_page()
+                page.goto(URL, timeout=30000)
+                page.wait_for_timeout(3000)
+                html = page.content()
+                browser.close()
+                
+                all_offers = []
+                price_pattern = r'([\d.,]+)\s*&nbsp;€'
+                prices = re.findall(price_pattern, html)
+                quantity_pattern = r'Min\.\s*menge:</span>\s*(\d+)'
+                quantities = re.findall(quantity_pattern, html, re.IGNORECASE)
+                
+                for i, price_str in enumerate(prices):
+                    try:
+                        price = float(price_str.replace(',', '.'))
+                        if 0.0001 < price < 0.05:
+                            quantity = int(quantities[i]) if i < len(quantities) else None
+                            all_offers.append({'price': price, 'quantity': quantity})
+                    except:
+                        continue
+                
+                unique = []
+                seen = set()
+                for o in all_offers:
+                    key = f"{o['price']}_{o['quantity']}"
+                    if key not in seen:
+                        seen.add(key)
+                        unique.append(o)
+                
+                unique.sort(key=lambda x: x['price'])
+                
+                if MIN_QUANTITY:
+                    return [o for o in unique if is_quantity_match(o['quantity'])]
+                return unique
+                
+        except Exception as e2:
+            print(f"  [Playwright error: {e2}]")
+            return None
 
 def format_price(p):
     return f"{p:.5f}".replace('.', ',')
@@ -251,8 +266,12 @@ def format_number(n):
     return f"{n:,}".replace(',', '.')
 
 def send_startup_message():
-    """Send startup message"""
-    print("\n[Starting] Getting current offers...")
+    """Send startup message with current best offer"""
+    global startup_sent
+    
+    print("\n[Startup] Getting current offers...")
+    send_telegram("🤖 Robux Tracker is starting up... Fetching current prices...")
+    
     offers = get_offers()
     
     if offers and len(offers) > 0:
@@ -278,7 +297,9 @@ Minimum: {format_number(best['quantity'])} Robux"""
         
         send_telegram(message)
     else:
-        send_telegram("Robux Tracker Started - Scanning every minute")
+        send_telegram(f"Robux Tracker Started\n\nNo offers found in range {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)} Robux.\nWill keep scanning every minute.")
+    
+    startup_sent = True
 
 def send_alert(offer):
     """Send price alert"""
@@ -314,23 +335,16 @@ Buy: {URL}"""
 def get_german_time():
     return datetime.now(GERMAN_TZ)
 
-def send_daily_summary():
-    """Send summary at 22:00 German time"""
-    now = get_german_time()
-    if now.hour == 22 and now.minute < 5:
-        send_telegram(f"Daily summary at {now.strftime('%d.%m.%Y %H:%M')}\nTarget: €{format_price(TARGET_PRICE)}\nMin: {MIN_QUANTITY} Robux")
-        return True
-    return False
-
 def main():
-    global last_alerted_offers
+    global last_alerted_offers, running, startup_sent
     
     print("=" * 60)
-    print("Robux Price Tracker")
+    print("Robux Price Tracker - Railway Edition")
     print(f"Target: €{format_price(TARGET_PRICE)}")
     print(f"Min Quantity: {MIN_QUANTITY} Robux (75% tolerance = {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)})")
     print(f"Check every: {CHECK_INTERVAL} seconds")
-    print("Commands: /price, /setprice, /min, /setmin, /clean, /help")
+    print("=" * 60)
+    print("Logs below - waiting for commands...")
     print("=" * 60)
     
     # Start command polling
@@ -346,42 +360,50 @@ def main():
     send_startup_message()
     
     last_summary_date = None
+    scan_count = 0
     
     while running:
-        # Daily summary at 22:00
-        now = get_german_time()
-        current_date = now.strftime('%Y-%m-%d')
-        if now.hour == 22 and now.minute < 5 and last_summary_date != current_date:
-            send_daily_summary()
-            last_summary_date = current_date
-        
-        # Scan
-        print(f"\n[{now.strftime('%H:%M:%S')}] Scanning...")
-        
-        offers = get_offers()
-        
-        if offers and len(offers) > 0:
-            best = offers[0]
-            print(f"  Found {len(offers)} offer(s) within {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)} range")
-            print(f"  Best: €{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)")
+        try:
+            # Daily summary at 22:00 German time
+            now = get_german_time()
+            current_date = now.strftime('%Y-%m-%d')
+            if now.hour == 22 and now.minute < 5 and last_summary_date != current_date:
+                send_telegram(f"Daily summary - Target: €{format_price(TARGET_PRICE)} | Min: {MIN_QUANTITY} Robux")
+                last_summary_date = current_date
             
-            for i, o in enumerate(offers[:3], 1):
-                print(f"    {i}. €{format_price(o['price'])} - min {format_number(o['quantity'])}")
+            # Scan
+            print(f"\n[{now.strftime('%H:%M:%S')}] Scan #{scan_count + 1}...")
             
-            offer_id = f"{best['price']}_{best['quantity']}"
-            if best['price'] <= TARGET_PRICE and offer_id not in last_alerted_offers:
-                send_alert(best)
-                last_alerted_offers.add(offer_id)
-                print("  >>> ALERT SENT <<<")
-            elif best['price'] <= TARGET_PRICE:
-                print("  Target reached (already alerted)")
+            offers = get_offers()
+            
+            if offers and len(offers) > 0:
+                best = offers[0]
+                print(f"  Found {len(offers)} offer(s) within range")
+                print(f"  Best: €{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)")
+                
+                for i, o in enumerate(offers[:3], 1):
+                    print(f"    {i}. €{format_price(o['price'])} - min {format_number(o['quantity'])}")
+                
+                # Check alert
+                offer_id = f"{best['price']}_{best['quantity']}"
+                if best['price'] <= TARGET_PRICE and offer_id not in last_alerted_offers:
+                    send_alert(best)
+                    last_alerted_offers.add(offer_id)
+                    print("  >>> ALERT SENT <<<")
+                elif best['price'] <= TARGET_PRICE:
+                    print("  Target reached (already alerted)")
+                else:
+                    need = TARGET_PRICE - best['price']
+                    print(f"  Need €{format_price(need)} lower")
             else:
-                need = TARGET_PRICE - best['price']
-                print(f"  Need €{format_price(need)} lower")
-        else:
-            print(f"  No offers in range {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)} Robux")
-        
-        time.sleep(CHECK_INTERVAL)
+                print(f"  No offers in range {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)} Robux")
+            
+            scan_count += 1
+            time.sleep(CHECK_INTERVAL)
+            
+        except Exception as e:
+            print(f"  [Main loop error: {e}]")
+            time.sleep(60)
 
 if __name__ == "__main__":
     try:

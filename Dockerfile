@@ -1,22 +1,30 @@
-FROM python:3.11-slim-bullseye
+FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libgbm1 \
+    libasound2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libxtst6 \
     wget \
     gnupg \
-    curl \
-    && curl -fsSL https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
-
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install Playwright and Chromium
+RUN python -m playwright install chromium
+RUN python -m playwright install-deps
+
 COPY robux_tracker.py .
 
-CMD ["python", "robux_tracker.py"]
+CMD ["python", "-u", "robux_tracker.py"]
