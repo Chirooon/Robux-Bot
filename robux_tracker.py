@@ -82,7 +82,7 @@ def check_for_commands():
                     offers = get_offers()
                     if offers and len(offers) > 0:
                         best = offers[0]
-                        msg = f"Best offer: €{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)"
+                        msg = f"Best offer in range:\n€{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)"
                         if best['price'] <= TARGET_PRICE:
                             msg += "\n✅ Target reached!"
                         else:
@@ -90,7 +90,7 @@ def check_for_commands():
                             msg += f"\nNeed €{diff} lower"
                         send_telegram(msg)
                     else:
-                        send_telegram("No offers found within your quantity range")
+                        send_telegram(f"No offers found in range {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)} Robux")
                 
                 elif text.startswith('/setprice'):
                     parts = text.split()
@@ -135,7 +135,10 @@ def check_for_commands():
 /setmin X - Set min (75% tolerance)
 /setmin off - Disable min
 /check - Force price check
-/help - This message"""
+/help - This message
+
+<b>How it works:</b>
+Finds the CHEAPEST offer that matches your quantity range (75% tolerance). Skips offers with wrong minimum order."""
                     send_telegram(help_msg)
                 
     except Exception as e:
@@ -144,6 +147,7 @@ def check_for_commands():
         processing_commands = False
 
 def is_quantity_match(offer_qty):
+    """Check if offer quantity matches with 75% tolerance"""
     if MIN_QUANTITY is None or offer_qty is None:
         return True if MIN_QUANTITY is None else False
     lower = int(MIN_QUANTITY * 0.25)
@@ -151,7 +155,7 @@ def is_quantity_match(offer_qty):
     return lower <= offer_qty <= upper
 
 def get_offers():
-    """Get offers using Playwright with proper waiting"""
+    """Get ALL offers, then filter to only those within quantity range"""
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
@@ -159,34 +163,29 @@ def get_offers():
             
             print("  Loading page...")
             page.goto(URL, timeout=30000)
-            
-            # Wait for price elements
-            try:
-                page.wait_for_selector('.buy-unit-price', timeout=10000)
-            except:
-                print("  Selector not found, continuing...")
-            
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)  # Wait for dynamic content
             
             html = page.content()
             browser.close()
             
             all_offers = []
             
-            # Extract prices and quantities
+            # Extract price and quantity pairs
+            # Pattern for price
             price_pattern = r'([\d.,]+)\s*&nbsp;€'
             prices = re.findall(price_pattern, html)
             
+            # Pattern for min quantity
             quantity_pattern = r'Min\.\s*menge:</span>\s*(\d+)'
             quantities = re.findall(quantity_pattern, html, re.IGNORECASE)
             
-            print(f"  Raw prices found: {len(prices)}")
-            print(f"  Raw quantities found: {len(quantities)}")
+            print(f"  Raw: {len(prices)} prices, {len(quantities)} quantities")
             
-            for i, price_str in enumerate(prices[:20]):  # Limit to first 20
+            # Match prices with quantities (they appear in same order on page)
+            for i, price_str in enumerate(prices):
                 try:
                     price = float(price_str.replace(',', '.'))
-                    if 0.0001 < price < 0.05:
+                    if 0.0001 < price < 0.05:  # Valid price range
                         quantity = int(quantities[i]) if i < len(quantities) else None
                         all_offers.append({'price': price, 'quantity': quantity})
                 except:
@@ -201,11 +200,21 @@ def get_offers():
                     seen.add(key)
                     unique.append(o)
             
+            # Sort by price (cheapest first)
             unique.sort(key=lambda x: x['price'])
             
+            # FILTER: Only keep offers within quantity range
             if MIN_QUANTITY:
                 filtered = [o for o in unique if is_quantity_match(o['quantity'])]
-                print(f"  Filtered to {len(filtered)} offers in range")
+                print(f"  Total offers: {len(unique)}")
+                print(f"  In range ({int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)}): {len(filtered)}")
+                
+                # Show what was filtered out
+                if len(unique) > len(filtered):
+                    for o in unique[:5]:
+                        if not is_quantity_match(o['quantity']):
+                            print(f"    Skipped: €{format_price(o['price'])} (min {format_number(o['quantity'])} Robux) - outside range")
+                
                 return filtered
             return unique
             
@@ -224,12 +233,10 @@ def format_number(n):
 def send_startup_message():
     global startup_sent
     
-    print("\n[Startup] Fetching current prices...")
+    print("\n[Startup] Fetching current offers...")
     send_telegram("🤖 Robux Tracker Starting...")
     
-    # Wait a bit for the first scan
     time.sleep(3)
-    
     offers = get_offers()
     
     if offers and len(offers) > 0:
@@ -241,9 +248,9 @@ def send_startup_message():
 
 <b>Settings:</b>
 Target: €{format_price(TARGET_PRICE)}
-Min: {MIN_QUANTITY} Robux (matches {low}-{high})
+Min required: {MIN_QUANTITY} Robux (matches {low}-{high})
 
-<b>Current best offer:</b>
+<b>Best offer IN YOUR RANGE:</b>
 Price: €{format_price(best['price'])}
 Min order: {format_number(best['quantity'])} Robux"""
 
@@ -296,9 +303,9 @@ def main():
     global last_alerted_offers, running, startup_sent
     
     print("=" * 60)
-    print("Robux Price Tracker - Railway Edition")
+    print("Robux Price Tracker - Finds best offer IN your quantity range")
     print(f"Target: €{format_price(TARGET_PRICE)}")
-    print(f"Min Quantity: {MIN_QUANTITY} Robux")
+    print(f"Min Required: {MIN_QUANTITY} Robux (75% tolerance = {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)})")
     print(f"Check interval: {CHECK_INTERVAL} seconds")
     print("=" * 60)
     
@@ -332,11 +339,13 @@ def main():
             
             if offers and len(offers) > 0:
                 best = offers[0]
-                print(f"  Best: €{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)")
+                print(f"  Best in range: €{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)")
                 
+                # Show top 3 in range
                 for i, o in enumerate(offers[:3], 1):
                     print(f"    {i}. €{format_price(o['price'])} - min {format_number(o['quantity'])}")
                 
+                # Check alert
                 offer_id = f"{best['price']}_{best['quantity']}"
                 if best['price'] <= TARGET_PRICE and offer_id not in last_alerted_offers:
                     send_alert(best)
@@ -348,7 +357,7 @@ def main():
                     need = TARGET_PRICE - best['price']
                     print(f"  Need €{format_price(need)} lower")
             else:
-                print(f"  No offers in range {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)}")
+                print(f"  No offers in range {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)} Robux")
             
             scan_count += 1
             time.sleep(CHECK_INTERVAL)
