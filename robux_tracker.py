@@ -19,14 +19,11 @@ GERMAN_TZ = timezone(timedelta(hours=2))
 QUANTITY_TOLERANCE = 0.75
 # ===================================
 
-# Track alerted offers (prevents duplicate alerts for SAME price)
-# But will alert again if price drops FURTHER
 last_alerted_offers = set()
 last_update_id = 0
 running = True
 processing_commands = False
 startup_sent = False
-last_alerted_price = None  # Track last alerted price
 
 def send_telegram(message, parse_mode="HTML"):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -39,13 +36,11 @@ def send_telegram(message, parse_mode="HTML"):
         }, timeout=10)
         if response.status_code == 200:
             print("  [Telegram OK]")
-        else:
-            print(f"  [Telegram Error: {response.status_code}]")
     except Exception as e:
         print(f"  [Telegram Error: {e}]")
 
 def check_for_commands():
-    global TARGET_PRICE, MIN_QUANTITY, last_update_id, last_alerted_offers, processing_commands, last_alerted_price
+    global TARGET_PRICE, MIN_QUANTITY, last_update_id, last_alerted_offers, processing_commands
     
     if processing_commands:
         return
@@ -85,7 +80,7 @@ def check_for_commands():
                     offers = get_offers()
                     if offers and len(offers) > 0:
                         best = offers[0]
-                        msg = f"Best offer in range:\n€{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)"
+                        msg = f"Best offer:\n€{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)"
                         if best['price'] <= TARGET_PRICE:
                             msg += "\n✅ Target reached!"
                         else:
@@ -93,7 +88,7 @@ def check_for_commands():
                             msg += f"\nNeed €{diff} lower"
                         send_telegram(msg)
                     else:
-                        send_telegram(f"No offers found in range {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)} Robux")
+                        send_telegram("No offers found. Website may have changed.")
                 
                 elif text.startswith('/setprice'):
                     parts = text.split()
@@ -102,10 +97,8 @@ def check_for_commands():
                             new_price = float(parts[1].replace(',', '.'))
                             if 0.001 <= new_price <= 0.05:
                                 TARGET_PRICE = new_price
-                                # Reset alerts when target changes
                                 last_alerted_offers.clear()
-                                last_alerted_price = None
-                                send_telegram(f"Target updated: €{format_price(TARGET_PRICE)}\nAlerts reset. Will alert when price reaches new target.")
+                                send_telegram(f"Target updated: €{format_price(TARGET_PRICE)}")
                             else:
                                 send_telegram("Invalid price. Use 0.001-0.05")
                         except:
@@ -117,7 +110,6 @@ def check_for_commands():
                         if parts[1] == 'off':
                             MIN_QUANTITY = None
                             last_alerted_offers.clear()
-                            last_alerted_price = None
                             send_telegram("Minimum quantity disabled")
                         else:
                             try:
@@ -125,10 +117,9 @@ def check_for_commands():
                                 if new_min >= 100:
                                     MIN_QUANTITY = new_min
                                     last_alerted_offers.clear()
-                                    last_alerted_price = None
                                     low = int(MIN_QUANTITY * 0.25)
                                     high = int(MIN_QUANTITY * 1.75)
-                                    send_telegram(f"Minimum set to {MIN_QUANTITY}\nMatches: {low}-{high} Robux\nAlerts reset.")
+                                    send_telegram(f"Minimum set to {MIN_QUANTITY}\nMatches: {low}-{high} Robux")
                                 else:
                                     send_telegram("Minimum must be at least 100")
                             except:
@@ -142,13 +133,7 @@ def check_for_commands():
 /setmin X - Set min (75% tolerance)
 /setmin off - Disable min
 /check - Force price check
-/help - This message
-
-<b>How it works:</b>
-✅ Scans every minute 24/7
-✅ Alerts when target reached
-✅ Continues scanning after alert
-✅ Will alert again if price drops further"""
+/help - This message"""
                     send_telegram(help_msg)
                 
     except Exception as e:
@@ -164,6 +149,7 @@ def is_quantity_match(offer_qty):
     return lower <= offer_qty <= upper
 
 def get_offers():
+    """Get offers by looking for price patterns in the page"""
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
@@ -171,32 +157,66 @@ def get_offers():
             
             print("  Loading page...")
             page.goto(URL, timeout=30000)
+            
+            # Wait for content
             page.wait_for_timeout(5000)
             
+            # Get page content
             html = page.content()
             browser.close()
             
-            all_offers = []
+            # Method 1: Look for price with € symbol
+            price_pattern1 = r'(\d+[.,]\d+)\s*(?:&nbsp;)?\s*€'
+            prices1 = re.findall(price_pattern1, html)
             
-            price_pattern = r'([\d.,]+)\s*&nbsp;€'
-            prices = re.findall(price_pattern, html)
+            # Method 2: Look for price without € symbol but near Robux
+            price_pattern2 = r'(\d+[.,]\d+)\s*(?:Einheit|Robux|unit)'
+            prices2 = re.findall(price_pattern2, html, re.IGNORECASE)
             
-            quantity_pattern = r'Min\.\s*menge:</span>\s*(\d+)'
-            quantities = re.findall(quantity_pattern, html, re.IGNORECASE)
-            
-            for i, price_str in enumerate(prices):
+            # Combine all prices
+            all_prices = []
+            for p in prices1:
                 try:
-                    price = float(price_str.replace(',', '.'))
-                    if 0.0001 < price < 0.05:
-                        quantity = int(quantities[i]) if i < len(quantities) else None
-                        all_offers.append({'price': price, 'quantity': quantity})
+                    all_prices.append(float(p.replace(',', '.')))
                 except:
-                    continue
+                    pass
+            for p in prices2:
+                try:
+                    all_prices.append(float(p.replace(',', '.')))
+                except:
+                    pass
+            
+            # Filter reasonable prices (0.001 to 0.05 per Robux)
+            valid_prices = [p for p in all_prices if 0.0001 < p < 0.05]
+            valid_prices = sorted(set(valid_prices))
+            
+            # Look for quantities
+            qty_pattern = r'Min\.\s*menge:</span>\s*(\d+)'
+            quantities = re.findall(qty_pattern, html, re.IGNORECASE)
+            
+            # Build offers
+            offers = []
+            for i, price in enumerate(valid_prices):
+                qty = int(quantities[i]) if i < len(quantities) else None
+                offers.append({'price': price, 'quantity': qty})
+            
+            # If no structured offers found, try a different approach
+            if not offers:
+                # Look for any price/quantity pairs in the same container
+                containers = re.split(r'<div[^>]*class="[^"]*offer[^"]*"[^>]*>', html, re.IGNORECASE)
+                for container in containers:
+                    price_match = re.search(r'(\d+[.,]\d+)\s*(?:&nbsp;)?\s*€', container)
+                    qty_match = re.search(r'Min\.\s*menge:</span>\s*(\d+)', container, re.IGNORECASE)
+                    if price_match:
+                        price = float(price_match.group(1).replace(',', '.'))
+                        qty = int(qty_match.group(1)) if qty_match else None
+                        if 0.0001 < price < 0.05:
+                            offers.append({'price': price, 'quantity': qty})
             
             # Remove duplicates
             unique = []
             seen = set()
-            for o in all_offers:
+            for o in offers:
                 key = f"{o['price']}_{o['quantity']}"
                 if key not in seen:
                     seen.add(key)
@@ -204,13 +224,18 @@ def get_offers():
             
             unique.sort(key=lambda x: x['price'])
             
-            if MIN_QUANTITY:
+            print(f"  Found {len(unique)} total offers")
+            
+            # Filter by quantity if needed
+            if MIN_QUANTITY and unique:
                 filtered = [o for o in unique if is_quantity_match(o['quantity'])]
+                print(f"  {len(filtered)} offers within quantity range")
                 return filtered
+            
             return unique
             
     except Exception as e:
-        print(f"  [Playwright error: {e}]")
+        print(f"  [Error: {e}]")
         return None
 
 def format_price(p):
@@ -224,46 +249,37 @@ def format_number(n):
 def send_startup_message():
     global startup_sent
     
-    print("\n[Startup] Scanning for initial offers...")
-    send_telegram("🤖 Robux Tracker Starting...\nScanning every minute. Will alert when target reached.\n/help for commands")
+    print("\n[Startup] Scanning for offers...")
+    send_telegram("🤖 Robux Tracker Starting...\nScanning every minute.\n/help for commands")
     
-    time.sleep(3)
     offers = get_offers()
     
     if offers and len(offers) > 0:
         best = offers[0]
-        low = int(MIN_QUANTITY * 0.25)
-        high = int(MIN_QUANTITY * 1.75)
         
         message = f"""<b>✅ Robux Tracker Active</b>
 
 <b>Settings:</b>
 Target: €{format_price(TARGET_PRICE)}
-Min required: {MIN_QUANTITY} Robux (matches {low}-{high})
+Min required: {MIN_QUANTITY} Robux (75% tolerance)
 
 <b>Current best offer:</b>
-Price: €{format_price(best['price'])}
+Price: €{format_price(best['price'])} per Robux
 Min order: {format_number(best['quantity'])} Robux"""
 
         if best['price'] <= TARGET_PRICE:
-            message += "\n\n🎯 TARGET ALREADY REACHED!\nAlert sent (if not alerted before)"
-            # Check if we should alert immediately
-            offer_id = f"{best['price']}_{best['quantity']}"
-            if offer_id not in last_alerted_offers:
-                send_alert(best, is_startup=True)
-                last_alerted_offers.add(offer_id)
+            message += "\n\n🎯 TARGET ALREADY REACHED!"
         else:
             diff = format_price(TARGET_PRICE - best['price'])
-            message += f"\n\n📉 Need €{diff} lower to reach target"
+            message += f"\n\nNeed €{diff} lower to reach target"
         
-        message += "\n\n✅ Bot will continue scanning every minute even after target reached."
         send_telegram(message)
     else:
-        send_telegram(f"⚠️ Robux Tracker Started\n\nNo offers found in range.\nWill keep scanning every minute.\n\n/help for commands")
+        send_telegram(f"⚠️ Robux Tracker Started\n\nFound {len(offers) if offers else 0} offers.\nIf you see '0 offers', the website structure may have changed.\n\nUse /check to test.")
     
     startup_sent = True
 
-def send_alert(offer, is_startup=False):
+def send_alert(offer):
     price = offer['price']
     qty = offer['quantity']
     diff = TARGET_PRICE - price
@@ -277,35 +293,13 @@ def send_alert(offer, is_startup=False):
     else:
         emoji = "🟢✅"
     
-    low = int(MIN_QUANTITY * 0.25)
-    high = int(MIN_QUANTITY * 1.75)
-    
-    if is_startup:
-        message = f"""<b>🎯 TARGET REACHED (from startup scan)!</b>
+    message = f"""<b>{emoji} TARGET REACHED!</b>
 
-{emoji} Price: €{format_price(price)}
-🎯 Target: €{format_price(TARGET_PRICE)}
-📦 Minimum: {format_number(qty)} Robux
+Price: €{format_price(price)} per Robux
+Target: €{format_price(TARGET_PRICE)}
+Minimum order: {format_number(qty)} Robux
 
-✅ Matches your requirement: {MIN_QUANTITY} Robux (range {low}-{high})
-
-🛒 Buy: {URL}
-
----
-Bot will continue scanning for even BETTER prices."""
-    else:
-        message = f"""<b>{emoji} TARGET REACHED!</b>
-
-💰 Price: €{format_price(price)}
-🎯 Target: €{format_price(TARGET_PRICE)}
-📦 Minimum: {format_number(qty)} Robux
-
-✅ Matches your requirement: {MIN_QUANTITY} Robux (range {low}-{high})
-
-🛒 Buy: {URL}
-
----
-📢 Bot continues scanning. Will alert again if price drops further."""
+Buy: {URL}"""
     
     send_telegram(message)
 
@@ -313,19 +307,13 @@ def get_german_time():
     return datetime.now(GERMAN_TZ)
 
 def main():
-    global last_alerted_offers, running, startup_sent, last_alerted_price
+    global last_alerted_offers, running
     
     print("=" * 60)
-    print("Robux Price Tracker - Continuous Scanning Mode")
+    print("Robux Price Tracker")
     print(f"Target: €{format_price(TARGET_PRICE)}")
-    print(f"Min Required: {MIN_QUANTITY} Robux (75% tolerance = {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)})")
+    print(f"Min Quantity: {MIN_QUANTITY} Robux (75% tolerance)")
     print(f"Check interval: {CHECK_INTERVAL} seconds")
-    print("=" * 60)
-    print("Bot will:")
-    print("  ✅ Scan every minute (24/7)")
-    print("  ✅ Alert when target reached")
-    print("  ✅ Continue scanning after alert")
-    print("  ✅ Alert again if price drops further")
     print("=" * 60)
     
     # Start command polling
@@ -337,7 +325,6 @@ def main():
     thread = threading.Thread(target=poll, daemon=True)
     thread.start()
     
-    # Send startup message
     send_startup_message()
     
     last_summary_date = None
@@ -348,9 +335,8 @@ def main():
             now = get_german_time()
             current_date = now.strftime('%Y-%m-%d')
             
-            # Daily summary at 22:00
             if now.hour == 22 and now.minute < 5 and last_summary_date != current_date:
-                send_telegram(f"📊 Daily Summary - Target: €{format_price(TARGET_PRICE)} | Min: {MIN_QUANTITY} Robux\nBot continues running...")
+                send_telegram(f"Daily Summary - Target: €{format_price(TARGET_PRICE)}")
                 last_summary_date = current_date
             
             print(f"\n[{now.strftime('%H:%M:%S')}] Scan #{scan_count + 1}")
@@ -358,41 +344,26 @@ def main():
             
             if offers and len(offers) > 0:
                 best = offers[0]
-                print(f"  Best in range: €{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)")
+                print(f"  Best: €{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)")
                 
-                for i, o in enumerate(offers[:3], 1):
-                    print(f"    {i}. €{format_price(o['price'])} - min {format_number(o['quantity'])}")
-                
-                # Check if target reached
-                if best['price'] <= TARGET_PRICE:
-                    offer_id = f"{best['price']}_{best['quantity']}"
-                    
-                    # Alert if this specific offer hasn't been alerted yet
-                    if offer_id not in last_alerted_offers:
-                        send_alert(best)
-                        last_alerted_offers.add(offer_id)
-                        print(f"  >>> ALERT SENT - Target reached at €{format_price(best['price'])} <<<")
-                    else:
-                        print(f"  Target reached but already alerted for this exact offer")
-                    
-                    # Also check if price improved (even lower than before)
-                    if last_alerted_price is None or best['price'] < last_alerted_price:
-                        if offer_id not in last_alerted_offers:
-                            last_alerted_price = best['price']
-                            print(f"  New lower price detected!")
+                offer_id = f"{best['price']}_{best['quantity']}"
+                if best['price'] <= TARGET_PRICE and offer_id not in last_alerted_offers:
+                    send_alert(best)
+                    last_alerted_offers.add(offer_id)
+                    print("  >>> ALERT SENT <<<")
+                elif best['price'] <= TARGET_PRICE:
+                    print("  Target reached (already alerted)")
                 else:
                     need = TARGET_PRICE - best['price']
-                    print(f"  Need €{format_price(need)} lower to reach target")
+                    print(f"  Need €{format_price(need)} lower")
             else:
-                print(f"  No offers in range {int(MIN_QUANTITY*0.25)}-{int(MIN_QUANTITY*1.75)} Robux")
+                print(f"  No offers found - check website")
             
             scan_count += 1
-            print(f"  Next scan in {CHECK_INTERVAL} seconds... (Bot will continue running)")
             time.sleep(CHECK_INTERVAL)
             
         except Exception as e:
             print(f"  Error: {e}")
-            print(f"  Retrying in 60 seconds...")
             time.sleep(60)
 
 if __name__ == "__main__":
@@ -400,10 +371,8 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nStopping...")
-        send_telegram("Robux Tracker stopped")
         running = False
     except Exception as e:
         print(f"\nFATAL: {e}")
-        send_telegram(f"Tracker crashed: {str(e)[:100]}")
         time.sleep(60)
-        main()  # Auto-restart on crash
+        main()
