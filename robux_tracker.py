@@ -36,6 +36,8 @@ def send_telegram(message, parse_mode="HTML"):
         }, timeout=10)
         if response.status_code == 200:
             print("  [Telegram OK]")
+        else:
+            print(f"  [Telegram Error: {response.status_code}]")
     except Exception as e:
         print(f"  [Telegram Error: {e}]")
 
@@ -77,7 +79,8 @@ def check_for_commands():
                 
                 elif text == '/check':
                     send_telegram("🔍 Checking prices...")
-                    offers = get_offers()
+                    # Force a fresh browser instance
+                    offers = get_offers(force_fresh=True)
                     if offers and len(offers) > 0:
                         best = offers[0]
                         msg = f"Best offer:\n€{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)"
@@ -88,7 +91,7 @@ def check_for_commands():
                             msg += f"\nNeed €{diff} lower"
                         send_telegram(msg)
                     else:
-                        send_telegram("No offers found. Website may have changed.")
+                        send_telegram("No offers found. The website may be blocking requests or the structure changed.")
                 
                 elif text.startswith('/setprice'):
                     parts = text.split()
@@ -133,7 +136,11 @@ def check_for_commands():
 /setmin X - Set min (75% tolerance)
 /setmin off - Disable min
 /check - Force price check
-/help - This message"""
+/help - This message
+
+<b>Troubleshooting:</b>
+If /check returns no offers, the website may be blocking the bot.
+The bot will automatically retry with different settings."""
                     send_telegram(help_msg)
                 
     except Exception as e:
@@ -148,70 +155,123 @@ def is_quantity_match(offer_qty):
     upper = int(MIN_QUANTITY * 1.75)
     return lower <= offer_qty <= upper
 
-def get_offers():
-    """Get offers by looking for price patterns in the page"""
+def get_offers(force_fresh=False):
+    """Get offers with anti-detection measures"""
     try:
+        # Rotate user agents
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        ]
+        
+        import random
+        user_agent = random.choice(user_agents)
+        
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            page = browser.new_page()
+            # Launch with stealth settings
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--disable-gpu',
+                    '--window-size=1920,1080'
+                ]
+            )
+            
+            context = browser.new_context(
+                user_agent=user_agent,
+                viewport={'width': 1920, 'height': 1080},
+                locale='de-DE',
+                timezone_id='Europe/Berlin'
+            )
+            
+            page = context.new_page()
             
             print("  Loading page...")
-            page.goto(URL, timeout=30000)
             
-            # Wait for content
-            page.wait_for_timeout(5000)
+            # Add random delay to avoid detection
+            time.sleep(random.uniform(1, 2))
             
-            # Get page content
+            page.goto(URL, timeout=45000, wait_until='domcontentloaded')
+            
+            # Wait random time
+            time.sleep(random.uniform(3, 5))
+            
+            # Scroll to simulate human behavior
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(1)
+            page.evaluate("window.scrollTo(0, 0)")
+            time.sleep(1)
+            
             html = page.content()
             browser.close()
             
-            # Method 1: Look for price with € symbol
-            price_pattern1 = r'(\d+[.,]\d+)\s*(?:&nbsp;)?\s*€'
-            prices1 = re.findall(price_pattern1, html)
+            # Try multiple patterns to find prices
+            offers = []
             
-            # Method 2: Look for price without € symbol but near Robux
-            price_pattern2 = r'(\d+[.,]\d+)\s*(?:Einheit|Robux|unit)'
-            prices2 = re.findall(price_pattern2, html, re.IGNORECASE)
+            # Pattern for the specific structure you showed earlier
+            patterns = [
+                # Pattern from your HTML: <strong ...> 0,00445&nbsp;€ </strong>
+                r'<strong[^>]*>[\s]*([\d.,]+)&nbsp;€[\s]*</strong>[\s]*<[^>]*>[\s]*/[\s]*Einheit',
+                # Generic price with €
+                r'([\d.,]+)\s*(?:&nbsp;)?\s*€',
+                # Price in text
+                r'€\s*([\d.,]+)',
+            ]
             
-            # Combine all prices
             all_prices = []
-            for p in prices1:
-                try:
-                    all_prices.append(float(p.replace(',', '.')))
-                except:
-                    pass
-            for p in prices2:
-                try:
-                    all_prices.append(float(p.replace(',', '.')))
-                except:
-                    pass
+            for pattern in patterns:
+                matches = re.findall(pattern, html)
+                for match in matches:
+                    try:
+                        price = float(match.replace(',', '.'))
+                        if 0.0001 < price < 0.05:
+                            all_prices.append(price)
+                    except:
+                        pass
             
-            # Filter reasonable prices (0.001 to 0.05 per Robux)
-            valid_prices = [p for p in all_prices if 0.0001 < p < 0.05]
-            valid_prices = sorted(set(valid_prices))
+            # Remove duplicates and sort
+            all_prices = sorted(set(all_prices))
             
-            # Look for quantities
-            qty_pattern = r'Min\.\s*menge:</span>\s*(\d+)'
-            quantities = re.findall(qty_pattern, html, re.IGNORECASE)
+            # Find quantities
+            qty_patterns = [
+                r'Min\.\s*menge:</span>\s*(\d+)',
+                r'minimum[\s]*order[\s]*:[\s]*(\d+)',
+                r'menge:</span>\s*(\d+)',
+            ]
+            
+            quantities = []
+            for pattern in qty_patterns:
+                matches = re.findall(pattern, html, re.IGNORECASE)
+                for match in matches:
+                    try:
+                        quantities.append(int(match))
+                    except:
+                        pass
             
             # Build offers
-            offers = []
-            for i, price in enumerate(valid_prices):
-                qty = int(quantities[i]) if i < len(quantities) else None
+            for i, price in enumerate(all_prices):
+                qty = quantities[i] if i < len(quantities) else None
                 offers.append({'price': price, 'quantity': qty})
             
-            # If no structured offers found, try a different approach
+            # If still no offers, try container-based extraction
             if not offers:
-                # Look for any price/quantity pairs in the same container
-                containers = re.split(r'<div[^>]*class="[^"]*offer[^"]*"[^>]*>', html, re.IGNORECASE)
+                containers = re.split(r'<div[^>]*class="[^"]*[Oo]ffer[^"]*"[^>]*>', html)
                 for container in containers:
-                    price_match = re.search(r'(\d+[.,]\d+)\s*(?:&nbsp;)?\s*€', container)
-                    qty_match = re.search(r'Min\.\s*menge:</span>\s*(\d+)', container, re.IGNORECASE)
+                    price_match = re.search(r'([\d.,]+)\s*(?:&nbsp;)?\s*€', container)
+                    qty_match = re.search(r'(\d+)\s*(?:Robux|Einheit|unit)', container, re.IGNORECASE)
                     if price_match:
-                        price = float(price_match.group(1).replace(',', '.'))
-                        qty = int(qty_match.group(1)) if qty_match else None
-                        if 0.0001 < price < 0.05:
-                            offers.append({'price': price, 'quantity': qty})
+                        try:
+                            price = float(price_match.group(1).replace(',', '.'))
+                            qty = int(qty_match.group(1)) if qty_match else None
+                            if 0.0001 < price < 0.05:
+                                offers.append({'price': price, 'quantity': qty})
+                        except:
+                            pass
             
             # Remove duplicates
             unique = []
@@ -226,10 +286,10 @@ def get_offers():
             
             print(f"  Found {len(unique)} total offers")
             
-            # Filter by quantity if needed
+            # Filter by quantity
             if MIN_QUANTITY and unique:
                 filtered = [o for o in unique if is_quantity_match(o['quantity'])]
-                print(f"  {len(filtered)} offers within quantity range")
+                print(f"  {len(filtered)} offers within range")
                 return filtered
             
             return unique
@@ -275,7 +335,7 @@ Min order: {format_number(best['quantity'])} Robux"""
         
         send_telegram(message)
     else:
-        send_telegram(f"⚠️ Robux Tracker Started\n\nFound {len(offers) if offers else 0} offers.\nIf you see '0 offers', the website structure may have changed.\n\nUse /check to test.")
+        send_telegram(f"⚠️ Robux Tracker Started\n\nCould not find any offers.\nThe website may have changed or is blocking requests.\n\nTry /check again in a few minutes.")
     
     startup_sent = True
 
@@ -310,7 +370,7 @@ def main():
     global last_alerted_offers, running
     
     print("=" * 60)
-    print("Robux Price Tracker")
+    print("Robux Price Tracker - Anti-Detection Mode")
     print(f"Target: €{format_price(TARGET_PRICE)}")
     print(f"Min Quantity: {MIN_QUANTITY} Robux (75% tolerance)")
     print(f"Check interval: {CHECK_INTERVAL} seconds")
@@ -329,6 +389,7 @@ def main():
     
     last_summary_date = None
     scan_count = 0
+    consecutive_failures = 0
     
     while running:
         try:
@@ -343,6 +404,7 @@ def main():
             offers = get_offers()
             
             if offers and len(offers) > 0:
+                consecutive_failures = 0
                 best = offers[0]
                 print(f"  Best: €{format_price(best['price'])} (min {format_number(best['quantity'])} Robux)")
                 
@@ -357,7 +419,12 @@ def main():
                     need = TARGET_PRICE - best['price']
                     print(f"  Need €{format_price(need)} lower")
             else:
-                print(f"  No offers found - check website")
+                consecutive_failures += 1
+                print(f"  No offers found ({consecutive_failures} failures in a row)")
+                
+                if consecutive_failures >= 5:
+                    send_telegram("⚠️ Warning: Multiple scan failures. The website may be blocking the bot. I'll keep trying.")
+                    consecutive_failures = 0
             
             scan_count += 1
             time.sleep(CHECK_INTERVAL)
